@@ -20,15 +20,14 @@ TOPICS_FILE = ROOT / "used_topics.txt"
 
 NICHE = os.environ.get("NICHE", "curiosidades históricas")
 VOICE = os.environ.get("TTS_VOICE", "es-ES-AlvaroNeural")
-MODELS = [m for m in [os.environ.get("GEMINI_MODEL"), "gemini-2.5-flash",
-                      "gemini-2.5-flash-lite", "gemini-flash-latest"] if m]
+FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-latest"]
 UA = "shorts-auto/1.0 (https://github.com/asiergames17-afk/shorts-auto)"
 W, H, FPS = 1080, 1920, 30
 
 
 # ---------------------------------------------------------------- utilidades
 def run(cmd):
-    r = subprocess.run(cmd, cwd=WORK, capture_output=True, text=True)
+    r = subprocess.run(cmd, cwd=WORK, capture_output=True, text=True, timeout=900)
     if r.returncode != 0:
         print(r.stderr[-1500:])
         raise RuntimeError(f"Falló: {' '.join(cmd[:3])}...")
@@ -42,11 +41,40 @@ def audio_duration(name):
 
 
 # -------------------------------------------------------------------- Gemini
+def candidate_models(key):
+    """Pregunta a Google qué modelos 'flash' hay disponibles y los ordena."""
+    names = []
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                         headers={"x-goog-api-key": key}, params={"pageSize": 200}, timeout=30)
+        r.raise_for_status()
+        for m in r.json().get("models", []):
+            n = m["name"].replace("models/", "")
+            if "generateContent" not in m.get("supportedGenerationMethods", []):
+                continue
+            if "flash" not in n or any(x in n for x in (
+                    "image", "tts", "live", "audio", "embedding", "robotics",
+                    "computer", "thinking", "native")):
+                continue
+            names.append(n)
+    except Exception as e:  # noqa: BLE001
+        print("[Gemini] No pude listar los modelos:", e)
+    names.sort(reverse=True)  # versiones más nuevas primero
+    names.sort(key=lambda n: (("preview" in n or "exp" in n), ("lite" in n)))
+    ordered = []
+    for n in [os.environ.get("GEMINI_MODEL")] + names + FALLBACK_MODELS:
+        if n and n not in ordered:
+            ordered.append(n)
+    return ordered[:6]
+
+
 def gemini_json(prompt):
     key = os.environ["GEMINI_API_KEY"]
+    models = candidate_models(key)
+    print("[Gemini] Modelos a probar:", ", ".join(models))
     last = None
-    for model in MODELS:
-        for attempt in range(3):
+    for ronda in range(4):
+        for model in models:
             try:
                 r = requests.post(
                     f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
@@ -54,21 +82,27 @@ def gemini_json(prompt):
                     json={"contents": [{"parts": [{"text": prompt}]}],
                           "generationConfig": {"responseMimeType": "application/json",
                                                "temperature": 0.9}},
-                    timeout=90)
-                if r.status_code == 404:
-                    last = f"{model}: no existe"
-                    break
-                if r.status_code in (429, 500, 503):
-                    last = f"{model}: HTTP {r.status_code}"
-                    time.sleep(10 * (attempt + 1))
-                    continue
-                r.raise_for_status()
-                text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    timeout=120)
+            except requests.RequestException as e:
+                last = f"{model}: {e}"
+                print("[Gemini]", last)
+                continue
+            if r.status_code != 200:
+                last = f"{model}: HTTP {r.status_code} {r.text[:200]}"
+                print("[Gemini]", last)
+                continue
+            try:
+                parts = r.json()["candidates"][0]["content"]["parts"]
+                text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
                 text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
                 return json.loads(text)
-            except (requests.RequestException, KeyError, IndexError, json.JSONDecodeError) as e:
-                last = f"{model}: {e}"
-                time.sleep(5)
+            except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
+                last = f"{model}: respuesta no válida ({e})"
+                print("[Gemini]", last)
+        if ronda < 3:
+            espera = 45 * (ronda + 1)
+            print(f"[Gemini] Todos fallaron. Reintento en {espera}s...")
+            time.sleep(espera)
     raise RuntimeError(f"Gemini falló: {last}")
 
 
@@ -164,6 +198,16 @@ async def tts(text, path):
     return words
 
 
+def make_voice(text):
+    for i in range(3):
+        try:
+            return asyncio.run(asyncio.wait_for(tts(text, WORK / "voice.mp3"), 180))
+        except Exception as e:  # noqa: BLE001
+            print(f"[Voz] intento {i + 1} falló: {e!r}")
+            time.sleep(5)
+    raise RuntimeError("La voz (edge-tts) falló 3 veces")
+
+
 def proportional_words(script, dur):
     ws = script.split()
     total = sum(len(w) + 2 for w in ws)
@@ -240,6 +284,7 @@ def upload_youtube(path, title, description, tags):
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
     from googleapiclient.http import MediaFileUpload
 
     creds = Credentials(
@@ -255,9 +300,16 @@ def upload_youtube(path, title, description, tags):
             "status": {"privacyStatus": "private", "selfDeclaredMadeForKids": False}}
     req = yt.videos().insert(part="snippet,status", body=body,
                              media_body=MediaFileUpload(str(path), chunksize=-1, resumable=True))
-    resp = None
+    resp, fallos = None, 0
     while resp is None:
-        _, resp = req.next_chunk()
+        try:
+            _, resp = req.next_chunk()
+        except HttpError as e:
+            if e.resp.status in (500, 502, 503, 504) and fallos < 5:
+                fallos += 1
+                time.sleep(5 * fallos)
+                continue
+            raise
     print("Subido a YouTube (privado). ID:", resp["id"])
 
 
@@ -269,7 +321,7 @@ def main():
     plan = make_plan("; ".join(used_list[-80:]))
     print("Tema:", plan["topic"])
 
-    words = asyncio.run(tts(plan["script"], WORK / "voice.mp3"))
+    words = make_voice(plan["script"])
     dur = audio_duration("voice.mp3")
     if not words:
         words = proportional_words(plan["script"], dur)
